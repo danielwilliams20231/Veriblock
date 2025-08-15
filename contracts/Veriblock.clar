@@ -20,6 +20,12 @@
 (define-constant ERR_BIDDING_CLOSED (err u113))
 (define-constant ERR_INVALID_BID (err u114))
 (define-constant ERR_BID_NOT_FOUND (err u115))
+(define-constant ERR_CONSENSUS_NOT_REACHED (err u116))
+(define-constant ERR_ALREADY_VOTED (err u117))
+(define-constant ERR_CONSENSUS_EXPIRED (err u118))
+(define-constant ERR_INVALID_THRESHOLD (err u119))
+(define-constant ERR_INSUFFICIENT_VERIFIERS (err u120))
+(define-constant ERR_CONSENSUS_CLOSED (err u121))
 
 (define-data-var verification-fee uint u1000000)
 (define-data-var verifier-registration-fee uint u5000000)
@@ -28,6 +34,9 @@
 (define-data-var slashing-percentage uint u10)
 (define-data-var staking-reward-rate uint u5)
 (define-data-var bidding-period uint u144)
+(define-data-var consensus-threshold-percentage uint u67)
+(define-data-var consensus-expiry-period uint u288)
+(define-data-var minimum-consensus-verifiers uint u3)
 
 (define-map authorized-verifiers
   principal
@@ -115,8 +124,49 @@
   }
 )
 
+;; Multi-party verification consensus system
+(define-map consensus-verifications
+  uint
+  {
+    requester: principal,
+    proof-hash: (buff 32),
+    verification-type: (string-ascii 32),
+    required-verifiers: uint,
+    threshold-percentage: uint,
+    total-fee: uint,
+    fee-per-verifier: uint,
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 16),
+    votes-for: uint,
+    votes-against: uint,
+    total-votes: uint,
+    consensus-reached: bool
+  }
+)
+
+(define-map consensus-votes
+  { consensus-id: uint, verifier: principal }
+  {
+    vote: bool,
+    weight: uint,
+    timestamp: uint,
+    reasoning: (string-ascii 128)
+  }
+)
+
+(define-map consensus-participants
+  { consensus-id: uint, verifier: principal }
+  {
+    invited: bool,
+    responded: bool,
+    fee-claimed: bool
+  }
+)
+
 (define-data-var next-request-id uint u1)
 (define-data-var next-lockup-id uint u1)
+(define-data-var next-consensus-id uint u1)
 
 (define-public (register-verifier (name (string-ascii 64)))
   (let (
@@ -628,3 +678,337 @@
     )
   )
 )
+
+;; Multi-party verification consensus functions
+(define-public (create-consensus-verification 
+  (verification-type (string-ascii 32)) 
+  (proof-hash (buff 32)) 
+  (required-verifiers uint) 
+  (verifier-list (list 10 principal))
+  (total-fee uint))
+  (let (
+    (consensus-id (var-get next-consensus-id))
+    (fee-per-verifier (/ total-fee required-verifiers))
+  )
+    ;; Validation checks
+    (asserts! (>= required-verifiers (var-get minimum-consensus-verifiers)) ERR_INSUFFICIENT_VERIFIERS)
+    (asserts! (<= required-verifiers (len verifier-list)) ERR_INSUFFICIENT_VERIFIERS)
+    (asserts! (> total-fee u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (stx-get-balance tx-sender) total-fee) ERR_INSUFFICIENT_PAYMENT)
+    
+    ;; Transfer fee and create verification, then complete setup
+    (match (stx-transfer? total-fee tx-sender (as-contract tx-sender))
+      success (if (map-set consensus-verifications consensus-id {
+                    requester: tx-sender,
+                    proof-hash: proof-hash,
+                    verification-type: verification-type,
+                    required-verifiers: required-verifiers,
+                    threshold-percentage: (var-get consensus-threshold-percentage),
+                    total-fee: total-fee,
+                    fee-per-verifier: fee-per-verifier,
+                    created-at: stacks-block-height,
+                    expires-at: (+ stacks-block-height (var-get consensus-expiry-period)),
+                    status: "pending",
+                    votes-for: u0,
+                    votes-against: u0,
+                    total-votes: u0,
+                    consensus-reached: false
+                  })
+                ;; Complete setup and return consensus ID
+                (let (
+                  (invite-result (invite-verifiers-to-consensus consensus-id verifier-list))
+                )
+                  (var-set next-consensus-id (+ consensus-id u1))
+                  (ok consensus-id)
+                )
+                ;; Return error if map-set fails
+                ERR_INVALID_AMOUNT
+              )
+      error ERR_INSUFFICIENT_PAYMENT
+    )
+  )
+)
+
+(define-public (cast-consensus-vote 
+  (consensus-id uint) 
+  (vote bool) 
+  (reasoning (string-ascii 128)))
+  (let (
+    (vote-key { consensus-id: consensus-id, verifier: tx-sender })
+    (participant-key { consensus-id: consensus-id, verifier: tx-sender })
+    (verifier-info (unwrap! (map-get? authorized-verifiers tx-sender) ERR_INVALID_VERIFIER))
+  )
+    (match (map-get? consensus-verifications consensus-id)
+      consensus-data (begin
+        ;; Validation checks
+        (asserts! (is-eq (get status consensus-data) "pending") ERR_CONSENSUS_CLOSED)
+        (asserts! (< stacks-block-height (get expires-at consensus-data)) ERR_CONSENSUS_EXPIRED)
+        (asserts! (is-none (map-get? consensus-votes vote-key)) ERR_ALREADY_VOTED)
+        (asserts! (is-verifier-active tx-sender) ERR_INVALID_VERIFIER)
+        
+        ;; Check if verifier is invited
+        (match (map-get? consensus-participants participant-key)
+          participant-data (begin
+            (asserts! (get invited participant-data) ERR_UNAUTHORIZED)
+            
+            ;; Calculate vote weight based on reputation and stake
+            (let (
+              (base-weight u1)
+              (reputation-weight (/ (get reputation-score verifier-info) u50))
+              (stake-weight (match (map-get? verifier-stakes tx-sender)
+                stake-data (/ (get staked-amount stake-data) u5000000)
+                u0
+              ))
+              (total-weight (+ base-weight reputation-weight stake-weight))
+            )
+              ;; Record the vote
+              (map-set consensus-votes vote-key {
+                vote: vote,
+                weight: total-weight,
+                timestamp: stacks-block-height,
+                reasoning: reasoning
+              })
+              
+              ;; Update participant status
+              (map-set consensus-participants participant-key 
+                (merge participant-data { responded: true }))
+              
+              ;; Update consensus vote counts
+              (let (
+                (new-votes-for (if vote 
+                  (+ (get votes-for consensus-data) total-weight) 
+                  (get votes-for consensus-data)))
+                (new-votes-against (if vote 
+                  (get votes-against consensus-data)
+                  (+ (get votes-against consensus-data) total-weight)))
+                (new-total-votes (+ (get total-votes consensus-data) total-weight))
+              )
+                (map-set consensus-verifications consensus-id 
+                  (merge consensus-data {
+                    votes-for: new-votes-for,
+                    votes-against: new-votes-against,
+                    total-votes: new-total-votes
+                  }))
+                
+                ;; Check if consensus threshold is reached
+                (unwrap-panic (check-consensus-threshold consensus-id))
+                (ok total-weight)
+              )
+            )
+          )
+          ERR_UNAUTHORIZED
+        )
+      )
+      ERR_VERIFICATION_NOT_FOUND
+    )
+  )
+)
+
+(define-public (finalize-consensus (consensus-id uint))
+  (match (map-get? consensus-verifications consensus-id)
+    consensus-data (begin
+      ;; Only requester or contract owner can finalize
+      (asserts! (or (is-eq tx-sender (get requester consensus-data)) 
+                    (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+      (asserts! (or (get consensus-reached consensus-data)
+                    (>= stacks-block-height (get expires-at consensus-data))) ERR_CONSENSUS_NOT_REACHED)
+      
+      (let (
+        (votes-for (get votes-for consensus-data))
+        (votes-against (get votes-against consensus-data))
+        (total-votes (get total-votes consensus-data))
+        (threshold-percentage (get threshold-percentage consensus-data))
+        (verification-passed (>= (* votes-for u100) (* total-votes threshold-percentage)))
+      )
+        ;; Update final status
+        (map-set consensus-verifications consensus-id 
+          (merge consensus-data { 
+            status: (if verification-passed "verified" "rejected"),
+            consensus-reached: true
+          }))
+        
+        ;; If verification passed, create proof record
+        (if verification-passed
+          (begin
+            (map-set verification-proofs (get proof-hash consensus-data) {
+              requester: (get requester consensus-data),
+              verifier: CONTRACT_OWNER, ;; Multi-party verification by contract
+              proof-type: (get verification-type consensus-data),
+              timestamp: stacks-block-height,
+              validity-period: (var-get verification-validity-period)
+            })
+            ;; Distribute fees to participating verifiers
+            (unwrap-panic (distribute-consensus-fees consensus-id))
+          )
+          ;; Refund requester if verification failed
+          (try! (as-contract (stx-transfer? (get total-fee consensus-data) 
+                                           tx-sender 
+                                           (get requester consensus-data))))
+        )
+        
+        (ok verification-passed)
+      )
+    )
+    ERR_VERIFICATION_NOT_FOUND
+  )
+)
+
+(define-public (claim-consensus-fee (consensus-id uint))
+  (let (
+    (participant-key { consensus-id: consensus-id, verifier: tx-sender })
+    (vote-key { consensus-id: consensus-id, verifier: tx-sender })
+  )
+    (match (map-get? consensus-verifications consensus-id)
+      consensus-data (begin
+        (asserts! (is-eq (get status consensus-data) "verified") ERR_CONSENSUS_NOT_REACHED)
+        
+        (match (map-get? consensus-participants participant-key)
+          participant-data (begin
+            (asserts! (get responded participant-data) ERR_UNAUTHORIZED)
+            (asserts! (not (get fee-claimed participant-data)) ERR_ALREADY_VERIFIED)
+            
+            ;; Check if verifier voted correctly (for verification)
+            (match (map-get? consensus-votes vote-key)
+              vote-data (begin
+                (asserts! (get vote vote-data) ERR_UNAUTHORIZED) ;; Must have voted "yes"
+                
+                (let (
+                  (fee-amount (get fee-per-verifier consensus-data))
+                )
+                  ;; Mark fee as claimed
+                  (map-set consensus-participants participant-key 
+                    (merge participant-data { fee-claimed: true }))
+                  
+                  ;; Transfer fee to verifier
+                  (unwrap! (as-contract (stx-transfer? fee-amount tx-sender tx-sender)) ERR_INSUFFICIENT_PAYMENT)
+                  (ok fee-amount)
+                )
+              )
+              ERR_VERIFICATION_NOT_FOUND
+            )
+          )
+          ERR_UNAUTHORIZED
+        )
+      )
+      ERR_VERIFICATION_NOT_FOUND
+    )
+  )
+)
+
+;; Private helper functions for consensus system
+(define-private (invite-verifiers-to-consensus (consensus-id uint) (verifier-list (list 10 principal)))
+  (begin
+    (map invite-single-verifier 
+         (map make-participant-tuple 
+              (map make-consensus-tuple 
+                   verifier-list 
+                   (list consensus-id consensus-id consensus-id consensus-id consensus-id 
+                         consensus-id consensus-id consensus-id consensus-id consensus-id))))
+    (ok true)
+  )
+)
+
+(define-private (make-consensus-tuple (verifier principal) (consensus-id uint))
+  { verifier: verifier, consensus-id: consensus-id }
+)
+
+(define-private (make-participant-tuple (data { verifier: principal, consensus-id: uint }))
+  { 
+    key: { consensus-id: (get consensus-id data), verifier: (get verifier data) },
+    verifier: (get verifier data)
+  }
+)
+
+(define-private (invite-single-verifier (data { key: { consensus-id: uint, verifier: principal }, verifier: principal }))
+  (if (is-verifier-active (get verifier data))
+    (map-set consensus-participants (get key data) {
+      invited: true,
+      responded: false,
+      fee-claimed: false
+    })
+    false
+  )
+)
+
+(define-private (check-consensus-threshold (consensus-id uint))
+  (match (map-get? consensus-verifications consensus-id)
+    consensus-data (let (
+      (votes-for (get votes-for consensus-data))
+      (total-votes (get total-votes consensus-data))
+      (required-verifiers (get required-verifiers consensus-data))
+      (threshold-percentage (get threshold-percentage consensus-data))
+      (min-votes-needed (/ (* required-verifiers u2) u3)) ;; At least 2/3 of required verifiers
+    )
+      (if (and (>= total-votes min-votes-needed)
+               (>= (* votes-for u100) (* total-votes threshold-percentage)))
+        (begin
+          (map-set consensus-verifications consensus-id 
+            (merge consensus-data { consensus-reached: true }))
+          (ok true)
+        )
+        (ok false)
+      )
+    )
+    ERR_VERIFICATION_NOT_FOUND
+  )
+)
+
+(define-private (distribute-consensus-fees (consensus-id uint))
+  (ok true) ;; Fees are claimed individually by verifiers
+)
+
+;; Configuration functions for consensus system
+(define-public (update-consensus-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (> new-threshold u50) (<= new-threshold u100)) ERR_INVALID_THRESHOLD)
+    (var-set consensus-threshold-percentage new-threshold)
+    (ok true)
+  )
+)
+
+(define-public (update-consensus-expiry-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_AMOUNT)
+    (var-set consensus-expiry-period new-period)
+    (ok true)
+  )
+)
+
+(define-public (update-minimum-consensus-verifiers (new-minimum uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (>= new-minimum u2) (<= new-minimum u10)) ERR_INVALID_AMOUNT)
+    (var-set minimum-consensus-verifiers new-minimum)
+    (ok true)
+  )
+)
+
+;; Read-only functions for consensus system
+(define-read-only (get-consensus-verification (consensus-id uint))
+  (map-get? consensus-verifications consensus-id)
+)
+
+(define-read-only (get-consensus-vote (consensus-id uint) (verifier principal))
+  (map-get? consensus-votes { consensus-id: consensus-id, verifier: verifier })
+)
+
+(define-read-only (get-consensus-participant (consensus-id uint) (verifier principal))
+  (map-get? consensus-participants { consensus-id: consensus-id, verifier: verifier })
+)
+
+(define-read-only (get-consensus-threshold-percentage)
+  (var-get consensus-threshold-percentage)
+)
+
+(define-read-only (get-consensus-expiry-period)
+  (var-get consensus-expiry-period)
+)
+
+(define-read-only (get-minimum-consensus-verifiers)
+  (var-get minimum-consensus-verifiers)
+)
+
+
+
